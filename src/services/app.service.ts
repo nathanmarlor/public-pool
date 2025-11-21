@@ -31,8 +31,9 @@ export class AppService implements OnModuleInit {
             setInterval(async () => {
                 console.log('Killing dead clients');
                 while (await this.clientService.killDeadClients()) {
-                    console.log('Finished killing clients');
+
                 }
+                console.log('Finished killing clients');
             }, 1000 * 60 * 5);
 
             setInterval(async () => {
