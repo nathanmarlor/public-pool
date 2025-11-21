@@ -9,7 +9,7 @@ import { ClientEntity } from './client.entity';
 @Injectable()
 export class ClientService {
 
-    private heartbeatBulkUpdate: { [id: string]:{id: string, hashRate: number, updatedAt: Date}} = {};
+    private heartbeatBulkUpdate: { [id: string]: { id: string, hashRate: number, updatedAt: Date } } = {};
 
     constructor(
         @InjectRepository(ClientEntity)
@@ -19,36 +19,54 @@ export class ClientService {
     }
 
     public async killDeadClients() {
+        const batchSize = 500;
 
-        return await this.clientRepository
+        const clients = await this.clientRepository
+            .createQueryBuilder('client')
+            .where('client.deletedAt IS NULL')
+            .andWhere('client.updatedAt < NOW() - INTERVAL \'5 minutes\'')
+            .orderBy('client.id', 'ASC')           // consistent lock order ← prevents deadlocks
+            .limit(batchSize)                      // small batches       ← prevents lock explosion
+            .setLock('pessimistic_write')          // adds FOR UPDATE SKIP LOCKED
+            .getMany();
+
+        if (clients.length === 0) {
+            return false; // nothing to do (caller can stop looping)
+        }
+
+        const ids = clients.map(c => c.id);
+
+        await this.clientRepository
             .createQueryBuilder()
             .update(ClientEntity)
-            .set({ deletedAt: () => "NOW()" })
-            .where("deletedAt IS NULL AND updatedAt < NOW() - interval '5 minutes' ")
+            .set({ deletedAt: () => 'NOW()' })
+            .whereInIds(ids)
             .execute();
+
+        return true; // tell caller there might be more batches
     }
 
     //public async heartbeat(id, hashRate: number, updatedAt: Date) {
     //     return await this.clientRepository.update({ id }, { hashRate, deletedAt: null, updatedAt });
     // }
 
-    public heartbeatBulkAsync(id, hashRate: number, updatedAt: Date){
-        if(this.heartbeatBulkUpdate[id] != null){
+    public heartbeatBulkAsync(id, hashRate: number, updatedAt: Date) {
+        if (this.heartbeatBulkUpdate[id] != null) {
             this.heartbeatBulkUpdate[id].hashRate = hashRate;
             this.heartbeatBulkUpdate[id].updatedAt = updatedAt;
             return;
         }
-        this.heartbeatBulkUpdate[id] = {id, hashRate, updatedAt};
+        this.heartbeatBulkUpdate[id] = { id, hashRate, updatedAt };
     }
 
-    public async doBulkHeartbeatUpdate(){
-        if(Object.keys(this.heartbeatBulkUpdate).length < 1){
+    public async doBulkHeartbeatUpdate() {
+        if (Object.keys(this.heartbeatBulkUpdate).length < 1) {
             console.log('No heartbeats to update.')
             return;
         }
 
         const values = Object.entries(this.heartbeatBulkUpdate).map(([key, value]) => {
-            return  `('${value.id}', ${value.hashRate}, NOW())`
+            return `('${value.id}', ${value.hashRate}, NOW())`
         }).join(',');
 
         const query = `
