@@ -1,6 +1,6 @@
 import { Injectable } from '@nestjs/common';
-import { InjectRepository } from '@nestjs/typeorm';
-import { Repository } from 'typeorm';
+import { InjectDataSource, InjectRepository } from '@nestjs/typeorm';
+import { DataSource, Repository } from 'typeorm';
 
 import { ClientEntity } from './client.entity';
 
@@ -12,38 +12,37 @@ export class ClientService {
     private heartbeatBulkUpdate: { [id: string]: { id: string, hashRate: number, updatedAt: Date } } = {};
 
     constructor(
+        @InjectDataSource()
+        private dataSource: DataSource,
         @InjectRepository(ClientEntity)
         private clientRepository: Repository<ClientEntity>
     ) {
 
     }
 
-    public async killDeadClients() {
-        const batchSize = 500;
+    public async killDeadClients(): Promise<boolean> {
+        return this.dataSource.transaction(async (manager) => {
+            const clients = await manager
+                .getRepository(ClientEntity)
+                .createQueryBuilder('c')
+                .where('c.deletedAt IS NULL')
+                .andWhere('c.updatedAt < NOW() - INTERVAL \'5 minutes\'')
+                .orderBy('c.id')
+                .limit(500)
+                .setLock('pessimistic_write')  // FOR UPDATE SKIP LOCKED
+                .getMany();
 
-        const clients = await this.clientRepository
-            .createQueryBuilder('client')
-            .where('client.deletedAt IS NULL')
-            .andWhere('client.updatedAt < NOW() - INTERVAL \'5 minutes\'')
-            .orderBy('client.id', 'ASC')           // consistent lock order ← prevents deadlocks
-            .limit(batchSize)                      // small batches       ← prevents lock explosion
-            .setLock('pessimistic_write')          // adds FOR UPDATE SKIP LOCKED
-            .getMany();
+            if (clients.length === 0) return false;
 
-        if (clients.length === 0) {
-            return false; // nothing to do (caller can stop looping)
-        }
+            await manager
+                .createQueryBuilder()
+                .update(ClientEntity)
+                .set({ deletedAt: () => 'NOW()' })
+                .whereInIds(clients.map(c => c.id))
+                .execute();
 
-        const ids = clients.map(c => c.id);
-
-        await this.clientRepository
-            .createQueryBuilder()
-            .update(ClientEntity)
-            .set({ deletedAt: () => 'NOW()' })
-            .whereInIds(ids)
-            .execute();
-
-        return true; // tell caller there might be more batches
+            return true;
+        });
     }
 
     //public async heartbeat(id, hashRate: number, updatedAt: Date) {

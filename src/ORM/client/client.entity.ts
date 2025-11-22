@@ -6,6 +6,10 @@ import { TrackedEntity } from '../utils/TrackedEntity.entity';
 
 @Entity()
 @Index("IDX_unique_nonce", { synchronize: false })
+@Index('idx_client_cleanup', ['updatedAt', 'id'], {
+    where: '"deletedAt" IS NULL',
+    // This is a partial (filtered) index — only indexes active clients
+})
 export class ClientEntity extends TrackedEntity {
 
     @PrimaryGeneratedColumn('uuid')
