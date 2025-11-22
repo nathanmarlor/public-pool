@@ -22,36 +22,31 @@ export class ClientService {
 
     // client.service.ts
     public async killDeadClients(): Promise<boolean> {
-        const BATCH_SIZE = 500;
+        const BATCH_SIZE = 10000;
 
-        return this.dataSource.transaction('REPEATABLE READ', async (manager) => {
-            // IMPORTANT: We use raw SQL for the SELECT + SKIP LOCKED
-            // This bypasses every TypeORM locking bug with inheritance
+        return this.dataSource.transaction('READ COMMITTED', async (manager) => {  // ← CHANGE HERE
             const deadClients: { id: string }[] = await manager.query(`
-            SELECT id
-            FROM client_entity
-            WHERE "deletedAt" IS NULL
-              AND "updatedAt" < NOW() - INTERVAL '5 minutes'
-            ORDER BY id
-            LIMIT $1
-            FOR UPDATE SKIP LOCKED
-        `, [BATCH_SIZE]);
+                SELECT id
+                FROM client_entity
+                WHERE "deletedAt" IS NULL
+                  AND "updatedAt" < NOW() - INTERVAL '5 minutes'
+                ORDER BY id
+                LIMIT $1
+                FOR UPDATE SKIP LOCKED
+            `, [BATCH_SIZE]);
 
             if (deadClients.length === 0) {
                 return false;
             }
 
-            const ids = deadClients.map(c => c.id);
-
-            // Now the update is safe and super fast
             await manager
                 .createQueryBuilder()
                 .update(ClientEntity)
                 .set({ deletedAt: () => 'NOW()' })
-                .whereInIds(ids)
+                .whereInIds(deadClients.map(c => c.id))
                 .execute();
 
-            console.log(`Killed ${deadClients.length}`);
+            console.log(`Killed ${deadClients.length} dead clients`);
 
             return true;
         });
