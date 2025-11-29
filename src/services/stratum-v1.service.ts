@@ -11,6 +11,11 @@ import { BitcoinRpcService } from './bitcoin-rpc.service';
 import { NotificationService } from './notification.service';
 import { StratumV1JobsService } from './stratum-v1-jobs.service';
 
+import { readFileSync } from 'fs';
+import { TlsOptions, TLSSocket, createServer } from 'tls';
+import * as path from 'path';
+
+
 
 @Injectable()
 export class StratumV1Service implements OnModuleInit {
@@ -20,111 +25,187 @@ export class StratumV1Service implements OnModuleInit {
     private normalClosure = 0;
     private errorClosure = 0;
 
-  constructor(
-    private readonly bitcoinRpcService: BitcoinRpcService,
-    private readonly clientService: ClientService,
-    private readonly clientStatisticsService: ClientStatisticsService,
-    private readonly notificationService: NotificationService,
-    private readonly blocksService: BlocksService,
-    private readonly configService: ConfigService,
-    private readonly stratumV1JobsService: StratumV1JobsService,
-    private readonly addressSettingsService: AddressSettingsService
-  ) {
+    constructor(
+        private readonly bitcoinRpcService: BitcoinRpcService,
+        private readonly clientService: ClientService,
+        private readonly clientStatisticsService: ClientStatisticsService,
+        private readonly notificationService: NotificationService,
+        private readonly blocksService: BlocksService,
+        private readonly configService: ConfigService,
+        private readonly stratumV1JobsService: StratumV1JobsService,
+        private readonly addressSettingsService: AddressSettingsService
+    ) {
 
-  }
-
-  async onModuleInit(): Promise<void> {
-
-    if (process.env.MASTER == 'true') {
-        await this.clientService.deleteAll();
     }
 
-    // wait for all the other processes to init for an even connection distribution 
-    setTimeout(() => {
-        process.env.STRATUM_PORTS.split(',').forEach(port =>{
-            this.startSocketServer(parseInt(port));
-        });
-    }, (10000));
+    async onModuleInit(): Promise<void> {
 
-    setInterval(() => {
-        console.log(`Socket stats: ${this.emptySocket} empty, ${this.socketTimeout} timeouts, ${this.normalClosure} normal closure, ${this.errorClosure} error closure`);
-        this.emptySocket = 0;
-        this.socketTimeout = 0;
-        this.normalClosure = 0;
-        this.errorClosure = 0;
-    }, 1000 * 60);
+        if (process.env.MASTER == 'true') {
+            await this.clientService.deleteAll();
+        }
 
-  }
+        // wait for all the other processes to init for an even connection distribution 
+        setTimeout(() => {
+            process.env.STRATUM_PORTS.split(',').forEach(port => {
+                this.startSocketServer(parseInt(port));
+            });
+            if (process.env.STRATUM_SECURE?.toLowerCase() === 'true') {
+                process.env.SECURE_STRATUM_PORTS.split(',').forEach(port => {
+                    this.startSecureSocketServer(parseInt(port));
+                });
+            }
+        }, (10000));
 
-  private startSocketServer(port: number) {
-    const server = new Server(async (socket: Socket) => {
-        // Set 15-minute timeout
-        socket.setTimeout(1000 * 60 * 15);
+        setInterval(() => {
+            console.log(`Socket stats: ${this.emptySocket} empty, ${this.socketTimeout} timeouts, ${this.normalClosure} normal closure, ${this.errorClosure} error closure`);
+            this.emptySocket = 0;
+            this.socketTimeout = 0;
+            this.normalClosure = 0;
+            this.errorClosure = 0;
+        }, 1000 * 60);
 
-        const client = new StratumV1Client(
-            socket,
-            this.stratumV1JobsService,
-            this.bitcoinRpcService,
-            this.clientService,
-            this.clientStatisticsService,
-            this.notificationService,
-            this.blocksService,
-            this.configService,
-            this.addressSettingsService
-        );
+    }
 
-        // Unified cleanup function
-        const cleanup = async (reason: string) => {
-            if (client.extraNonceAndSessionId != null) {
-                await client.destroy();
-                if(reason == 'Error'){
-                    this.errorClosure++;
-                }else{
-                    this.normalClosure++;
+    private startSocketServer(port: number) {
+        const server = new Server(async (socket: Socket) => {
+            // Set 15-minute timeout
+            socket.setTimeout(1000 * 60 * 15);
+
+            const client = new StratumV1Client(
+                socket,
+                this.stratumV1JobsService,
+                this.bitcoinRpcService,
+                this.clientService,
+                this.clientStatisticsService,
+                this.notificationService,
+                this.blocksService,
+                this.configService,
+                this.addressSettingsService
+            );
+
+            // Unified cleanup function
+            const cleanup = async (reason: string) => {
+                if (client.extraNonceAndSessionId != null) {
+                    await client.destroy();
+                    if (reason == 'Error') {
+                        this.errorClosure++;
+                    } else {
+                        this.normalClosure++;
+                    }
                 }
-            }
-            if (!socket.destroyed) {
-                socket.end();
-                socket.destroy();
-            }
+                if (!socket.destroyed) {
+                    socket.end();
+                    socket.destroy();
+                }
+            };
+
+            // Handle client disconnection
+            socket.on('close', async (hadError: boolean) => {
+                await cleanup(hadError ? "Error" : "Normal Closure");
+            });
+
+            // Handle socket timeouts
+            socket.on('timeout', async () => {
+                if (socket.bytesRead == 0 || socket.bytesWritten == 0) {
+                    this.emptySocket++;
+                } else {
+                    this.socketTimeout++;
+                }
+                await cleanup("Timeout");
+            });
+
+            // Handle errors properly
+            socket.on('error', async (error: Error) => {
+                await cleanup("Error");
+            });
+
+            //
+
+
+        });
+
+        // Ensure server itself handles errors
+        server.on('error', (err) => {
+            console.error(`Server error: ${err.message}`);
+        });
+
+        server.listen(port, () => {
+            console.log(`Stratum server is listening on port ${port}`);
+        });
+
+    }
+
+    private startSecureSocketServer(port: number) {
+
+        const currentDirectory = process.cwd();
+        const keyPath = path.join(currentDirectory, 'secrets', 'key.pem');
+        const certPath = path.join(currentDirectory, 'secrets', 'cert.pem');
+
+        const tlsOptions: TlsOptions = {
+            key: readFileSync(keyPath),
+            cert: readFileSync(certPath),
         };
 
-        // Handle client disconnection
-        socket.on('close', async (hadError: boolean) => {
-            await cleanup(hadError ? "Error" : "Normal Closure");
+        const server = createServer(tlsOptions, async (socket: TLSSocket) => {
+            // Set 15-minute timeout
+            socket.setTimeout(1000 * 60 * 15);
+
+            const client = new StratumV1Client(
+                socket,
+                this.stratumV1JobsService,
+                this.bitcoinRpcService,
+                this.clientService,
+                this.clientStatisticsService,
+                this.notificationService,
+                this.blocksService,
+                this.configService,
+                this.addressSettingsService
+            );
+
+            const cleanup = async (reason: string) => {
+                if (client.extraNonceAndSessionId != null) {
+                    await client.destroy();
+                    if (reason === 'Error') {
+                        this.errorClosure++;
+                    } else {
+                        this.normalClosure++;
+                    }
+                }
+                if (!socket.destroyed) {
+                    socket.end();
+                    socket.destroy();
+                }
+            };
+
+            socket.on('close', async (hadError: boolean) => {
+                await cleanup(hadError ? 'Error' : 'Normal Closure');
+            });
+
+            socket.on('timeout', async () => {
+                if (socket.bytesRead === 0 || socket.bytesWritten === 0) {
+                    this.emptySocket++;
+                } else {
+                    this.socketTimeout++;
+                }
+                await cleanup('Timeout');
+            });
+
+            socket.on('error', async (error: Error) => {
+                await cleanup('Error');
+            });
+
+            // your protocol handling stays the same
         });
 
-        // Handle socket timeouts
-        socket.on('timeout', async () => {
-            if(socket.bytesRead == 0 || socket.bytesWritten == 0){
-                this.emptySocket++;
-            }else{
-                this.socketTimeout++;
-            }
-            await cleanup("Timeout");
+        server.on('error', (err) => {
+            console.error(`Server error: ${err.message}`);
         });
 
-        // Handle errors properly
-        socket.on('error', async (error: Error) => {
-            await cleanup("Error");
+        server.listen(port, () => {
+            console.log(`Stratum TLS server is listening on port ${port}`);
         });
 
-        //
-
-
-    });
-
-    // Ensure server itself handles errors
-    server.on('error', (err) => {
-        console.error(`Server error: ${err.message}`);
-    });
-
-    server.listen(port, () => {
-        console.log(`Stratum server is listening on port ${port}`);
-    });
-
-
-}
+    }
 
 
 }
